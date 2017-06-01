@@ -17,16 +17,20 @@ class Cloud::Cycler::ASGroup
       @task.warn { "Autoscaling group #{@name} doesn't exist" }
       return
     end
+    
+    suspended = load_from_s3(@task.bucket)
 
-    if autoscaling_group.suspended_processes.empty?
-      @task.debug { "Scaling group #{@name} already running" }
-    else
+    # FIXME: This won't work if we reinstate suspended processes...
+    #if autoscaling_group.suspended_processes.empty?
+      #@task.debug { "Scaling group #{@name} already running" }
+    #else
       start_instances
 
       @task.unsafe("Resuming #{@name} processes") do
         autoscaling_group.resume_all_processes
+        autoscaling_group.suspend_processes suspended.keys
       end
-    end
+    #end
   end
 
   # Suspend the autoscaling processes and either terminate or stop the EC2
@@ -37,7 +41,8 @@ class Cloud::Cycler::ASGroup
       return
     end
 
-    if autoscaling_group.suspended_processes.empty?
+    # FIXME: This won't work if we reinstate suspended processes...
+    #if autoscaling_group.suspended_processes.empty?
       case action
       when :default, :terminate
         terminate_instances
@@ -46,9 +51,9 @@ class Cloud::Cycler::ASGroup
       else
         raise Cloud::Cycler::TaskFailure.new("Unrecognised autoscaling action #{action}")
       end
-    else
-      @task.debug { "Scaling group #{@name} already suspended" }
-    end
+    #else
+      #@task.debug { "Scaling group #{@name} already suspended" }
+    #end
   end
 
   # Terminate all the EC2 instances under the autoscaling group.
@@ -72,6 +77,7 @@ class Cloud::Cycler::ASGroup
   # instances.
   def stop_instances
     @task.unsafe("Stopping #{@name} processes") do
+      save_to_s3(@task.bucket)
       autoscaling_group.suspend_all_processes
     end
     autoscaling_instances.each do |instance|
@@ -116,6 +122,25 @@ class Cloud::Cycler::ASGroup
     # wait too long.
     sleep(@grace_period) if started > 0
   end
+  
+  #
+  # TODO: this is duplicated with cloudformation one, dry it up but don't understand it enough yet
+  #
+  # Save template and parameters to an S3 bucket
+  # Bucket may be created if it doesn't exist
+  def save_to_s3(bucket_name)
+    suspended  = autoscaling_group.suspended_processes.to_h.to_json
+
+    @task.unsafe("Writing #{@name} to bucket #{s3_bucket.name}") do
+      s3_object("suspended.json").write(suspended)
+    end
+  end
+
+  # Load template and parameters that were previously saved to an S3 bucket
+  def load_from_s3(bucket)
+    suspended = s3_object("suspended.json").read
+    return JSON.parse(suspended)
+  end
 
   private
 
@@ -136,5 +161,18 @@ class Cloud::Cycler::ASGroup
 
   def load_balancers
     autoscaling_group.load_balancers
+  end
+
+  # Memoization for S3 bucket object
+  def s3_bucket
+    return @s3_bucket if defined? @s3_bucket
+
+    s3 = AWS::S3.new(@task.aws_config)
+    @s3_bucket = s3.buckets[@task.bucket]
+  end
+
+  # Find an S3 object, prepending the task prefix, stack name, etc to the supplied path.
+  def s3_object(path)
+    @task.s3_object("asgroup/#{@name}/#{path}")
   end
 end
